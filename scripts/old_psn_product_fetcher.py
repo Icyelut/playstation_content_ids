@@ -3,6 +3,8 @@ import time
 import argparse
 import sys
 import pathlib
+import logging
+import logging_tree
 
 import requests
 import arrow
@@ -13,7 +15,7 @@ made by `Landcross#5410`
 modified slightly by mgrandi
 
 '''
-
+SECONDS_BETWEEN_RETRIES = 1
 SESSION = requests.session()
 BASE_URL = None
 
@@ -24,18 +26,63 @@ FILE_BASE = '.'
 
 FILE = None
 
-def make_request(url: str) -> dict:
-    response = SESSION.get(url)
-    while response.status_code != 200:
-        print('REQUEST FAILED. RETRYING in 5s...')
 
-        time.sleep(5)
+class ArrowLoggingFormatter(logging.Formatter):
+    """ logging.Formatter subclass that uses arrow, that formats the timestamp
+    to the local timezone (but its in ISO format)
+    """
+
+    def formatTime(self, record, datefmt=None):
+        return arrow.get("{}".format(record.created), "X").to("local").isoformat()
+
+
+def isFileType(strict=True):
+    def _isFileType(filePath):
+        ''' see if the file path given to us by argparse is a file
+        @param filePath - the filepath we get from argparse
+        @return the filepath as a pathlib.Path() if it is a file, else we raise a ArgumentTypeError'''
+
+        path_maybe = pathlib.Path(filePath)
+        path_resolved = None
+
+        # try and resolve the path
+        try:
+            path_resolved = path_maybe.resolve(strict=strict).expanduser()
+
+        except Exception as e:
+            raise argparse.ArgumentTypeError("Failed to parse `{}` as a path: `{}`".format(filePath, e))
+
+        # double check to see if its a file
+        if strict:
+            if not path_resolved.is_file():
+                raise argparse.ArgumentTypeError("The path `{}` is not a file!".format(path_resolved))
+
+        return path_resolved
+    return _isFileType
+
+
+def make_request(url: str) -> dict:
+    logger = logging.getLogger("make_request")
+
+    response = SESSION.get(url)
+    tries = 1
+    while response.status_code != 200 and tries <= 5:
+
+        logger.warning(f'REQUEST FAILED ({response.status_code}). RETRYING in {SECONDS_BETWEEN_RETRIES}s...')
+
+        time.sleep(SECONDS_BETWEEN_RETRIES)
         response = SESSION.get(url)
+        tries += 1
+
+    if tries > 5:
+        logger.warning(f'GIVING UP ON {url}')
+        return {}
 
     return response.json()
 
 
 def parse_result(data: dict, is_product: bool = False) -> None:
+    logger = logging.getLogger("parse_result")
     for item in data['data']['relationships']['children']['data']:
         item_type = item['type']
         item_id = item['id']
@@ -53,15 +100,20 @@ def parse_result(data: dict, is_product: bool = False) -> None:
 
 
 def traverse_storefront(storefront_id: str) -> None:
-    print(f'Found storefront {storefront_id}' + 20 * ' ', end='\r')
+    logger = logging.getLogger("traverse_storefront")
+    logger.info(f'Found storefront {storefront_id}')
 
     data = make_request(f'{BASE_URL}/storefront/{storefront_id}')
 
-    parse_result(data)
+    if data:
+        parse_result(data)
+    else:
+        logger.warning(f'FAILED TO GET DATA FOR {storefront_id} ({BASE_URL}/storefront/{storefront_id})')
 
 
 def traverse_container(container_id: str, is_product: bool = False) -> None:
-    print(f'---- Found container {container_id}' + 10 * ' ', end='\r')
+    logger = logging.getLogger("traverse_container")
+    logger.info(f'---- Found container {container_id}')
 
     global CONTAINER_LIST
     if container_id in CONTAINER_LIST:
@@ -71,20 +123,27 @@ def traverse_container(container_id: str, is_product: bool = False) -> None:
     page_size = 250
 
     data = make_request(f'{BASE_URL}/container/{container_id}?size={page_size}&start={current_offset}')
-    children = data['data']['relationships']['children']['data']
-
-    while len(children) > 0:
-        parse_result(data, is_product)
-
-        current_offset += len(children)
-        data = make_request(f'{BASE_URL}/container/{container_id}?size={page_size}&start={current_offset}')
+    if data:
         children = data['data']['relationships']['children']['data']
+
+        while len(children) > 0:
+            parse_result(data, is_product)
+
+            current_offset += len(children)
+            data = make_request(f'{BASE_URL}/container/{container_id}?size={page_size}&start={current_offset}')
+            if data:
+                children = data['data']['relationships']['children']['data']
+            else:
+                logger.warning(f'---- FAILED TO GET NEXT CHILDREN FOR CONTAINER {container_id}')
+    else:
+        logger.warning(f'---- FAILED TO GET CHILDREN FOR CONTAINER {container_id}')
 
     CONTAINER_LIST.append(container_id)
 
 
 def add_product(product_id: str) -> None:
-    print(f'-------- Found product {product_id}', end='\r')
+    logger = logging.getLogger("add_product")
+    logger.info(f'-------- Found product {product_id}')
 
     global PRODUCT_LIST, FILE
     if product_id not in PRODUCT_LIST:
@@ -97,14 +156,15 @@ def fetch_product(product_id: str) -> None:
 
 
 def main(args):
+    logger = logging.getLogger("main")
 
     language_code = args.region_language
     country_code = args.region_country
 
     start_time = arrow.utcnow()
 
-    print("language code: `{}`, country code: `{}`".format(language_code, country_code))
-    print("starting at `{}`".format(start_time))
+    logger.info("language code: `{}`, country code: `{}`".format(language_code, country_code))
+    logger.info("starting at `{}`".format(start_time))
 
     global BASE_URL, FILE, FILE_BASE, PRODUCT_LIST, CONTAINER_LIST
 
@@ -116,7 +176,7 @@ def main(args):
         PRODUCT_LIST = FILE.read().splitlines()
 
         CONTAINER_LIST = PRODUCT_LIST.copy()
-        print("opening existing file, got `{}` entries".format(len(PRODUCT_LIST)))
+        logger.info("opening existing file, got `{}` entries".format(len(PRODUCT_LIST)))
 
     else:
         FILE = open(os.path.join(FILE_BASE, f'{language_code}-{country_code}.txt'), 'w')
@@ -140,10 +200,10 @@ def main(args):
 
 
     end_time = arrow.utcnow()
-    print("finished at `{}`".format(end_time))
+    logger.info("finished at `{}`".format(end_time))
 
     elapsed_time = end_time - start_time
-    print("elapsed time: `{}`".format(elapsed_time))
+    logger.info("elapsed time: `{}`".format(elapsed_time))
 
 
 def isDirectoryType(filePath):
@@ -170,7 +230,16 @@ def isDirectoryType(filePath):
 
 if __name__ == "__main__":
 
+    # set up logging stuff
+    logging.captureWarnings(True)  # capture warnings with the logging infrastructure
+    root_logger = logging.getLogger()
+    logging_formatter = ArrowLoggingFormatter("%(asctime)s %(threadName)-10s %(name)-20s %(levelname)-8s: %(message)s")
+
     parser = argparse.ArgumentParser("old_psn_product_fetcher")
+
+    parser.add_argument("--log-to-file-path", dest="log_to_file_path", type=isFileType(False), help="log to the specified file")
+    parser.add_argument("--verbose", action="store_true", help="Increase logging verbosity")
+    parser.add_argument("--no-stdout", dest="no_stdout", action="store_true", help="if true, will not log to stdout" )
 
     parser.add_argument("region_language", help="the region language, aka the `en` in `en-US`")
     parser.add_argument("region_country", help="the region country, aka the `US` in `en-US`")
@@ -180,14 +249,35 @@ if __name__ == "__main__":
 
     parsed_args = parser.parse_args()
 
+    if parsed_args.log_to_file_path:
+        file_handler = logging.FileHandler(parsed_args.log_to_file_path, encoding="utf-8")
+        file_handler.setFormatter(logging_formatter)
+        root_logger.addHandler(file_handler)
+
+    if not parsed_args.no_stdout:
+        logging_handler = logging.StreamHandler(sys.stdout)
+        logging_handler.setFormatter(logging_formatter)
+        root_logger.addHandler(logging_handler)
+
+    # set logging level based on arguments
+    if parsed_args.verbose:
+        root_logger.setLevel("DEBUG")
+    else:
+        root_logger.setLevel("INFO")
+
+    root_logger.info("########### STARTING ###########")
+
+    root_logger.debug("Parsed arguments: %s", parsed_args)
+    root_logger.debug("Logger hierarchy:\n%s", logging_tree.format.build_description(node=None))
+
 
     try:
 
         main(parsed_args)
 
     except Exception as e:
-        print("something went wrong!: {}".format(e))
+        root_logger.exception("something went wrong!")
         sys.exit(1)
 
-    print("done!")
+    root_logger.info("Done!")
 
